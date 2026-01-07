@@ -20,6 +20,9 @@ MATCH_THRESHOLD = 85
 # HELPERS
 # ---------------------------
 
+def similarity(a, b):
+    return difflib.SequenceMatcher(None, a, b).ratio() * 100
+
 def fuzzy_match(name, candidates):
     matches = []
     for c in candidates:
@@ -31,8 +34,15 @@ def fuzzy_match(name, candidates):
 
 def load_ofac():
     df = pd.read_csv(OFAC_SDN_URL)
-    return df["SDN Name"].dropna().unique().tolist()
 
+    # Normalize column names
+    df.columns = [c.lower().strip() for c in df.columns]
+
+    # OFAC SDN usually uses 'name'
+    if "name" not in df.columns:
+        raise ValueError(f"OFAC columns not as expected: {df.columns}")
+
+    return df["name"].dropna().unique().tolist()
 
 def load_un():
     import xml.etree.ElementTree as ET
