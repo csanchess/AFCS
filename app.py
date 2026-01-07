@@ -3,7 +3,14 @@
 import streamlit as st
 import pandas as pd
 import requests
-from rapidfuzz import fuzz
+try:
+    from rapidfuzz import fuzz
+except ImportError:
+    st.error(
+        "rapidfuzz is not installed. Please check requirements.txt "
+        "and redeploy the app."
+    )
+    st.stop()
 import whois
 from datetime import datetime
 
