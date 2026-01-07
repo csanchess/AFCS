@@ -3,15 +3,7 @@
 import streamlit as st
 import pandas as pd
 import requests
-try:
-    from rapidfuzz import fuzz
-except ImportError:
-    st.error(
-        "rapidfuzz is not installed. Please check requirements.txt "
-        "and redeploy the app."
-    )
-    st.stop()
-import whois
+import difflib
 from datetime import datetime
 
 # ---------------------------
@@ -31,7 +23,7 @@ MATCH_THRESHOLD = 85
 def fuzzy_match(name, candidates):
     matches = []
     for c in candidates:
-        score = fuzz.token_sort_ratio(name.lower(), c.lower())
+        score = similarity(name.lower(), c.lower())
         if score >= MATCH_THRESHOLD:
             matches.append((c, score))
     return matches
