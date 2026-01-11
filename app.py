@@ -6,13 +6,13 @@ import requests
 from datetime import datetime
 import xml.etree.ElementTree as ET
 
-# Optional dependency (graceful degradation)
+from rapidfuzz import fuzz
+
+# Optional dependency
 try:
     import whois
 except ImportError:
     whois = None
-
-from rapidfuzz import fuzz
 
 # ---------------------------
 # CONFIG
@@ -23,12 +23,11 @@ OFAC_SDN_URL = "https://www.treasury.gov/ofac/downloads/sdn.csv"
 
 MATCH_THRESHOLD = 85
 
-# FATF-style country risk (simplified, public, contextual)
 FATF_HIGH_RISK = {"iran", "north korea", "myanmar"}
 FATF_MONITORED = {"panama", "haiti", "south sudan", "syria"}
 
 # ---------------------------
-# TEXT NORMALISATION & MATCHING
+# NORMALISATION & MATCHING
 # ---------------------------
 
 def normalize(text: str) -> str:
@@ -52,26 +51,19 @@ def fuzzy_match(query, candidates):
 @st.cache_data(ttl=86400)
 def load_ofac():
     """
-    Loads OFAC SDN list and extracts the correct name column.
-    Handles real-world OFAC CSV formats.
+    OFAC SDN CSV has NO HEADERS.
+    Column index 1 contains the SDN name.
     """
-    df = pd.read_csv(OFAC_SDN_URL)
+    df = pd.read_csv(OFAC_SDN_URL, header=None)
 
-    for col in df.columns:
-        col_l = col.lower()
-        if col_l in {"sdn_name", "name"}:
-            return df[col].dropna().unique().tolist()
+    if df.shape[1] < 2:
+        raise ValueError("OFAC SDN CSV format unexpected")
 
-    raise ValueError(f"OFAC SDN name column not found. Columns: {df.columns}")
+    names = df[1].dropna().unique().tolist()
+    return names
 
 @st.cache_data(ttl=86400)
 def load_un():
-    """
-    Loads UN Consolidated List and extracts:
-    - individual full names
-    - aliases
-    - entity names
-    """
     r = requests.get(UN_SANCTIONS_URL, timeout=30)
     tree = ET.fromstring(r.content)
 
@@ -107,10 +99,7 @@ def load_un():
 
 def check_domain(domain):
     if whois is None:
-        return {
-            "domain": domain,
-            "warning": "WHOIS module not available in this environment"
-        }
+        return {"domain": domain, "warning": "WHOIS not available"}
 
     try:
         w = whois.whois(domain)
@@ -121,13 +110,10 @@ def check_domain(domain):
             "country": w.country
         }
     except Exception:
-        return {
-            "domain": domain,
-            "error": "WHOIS lookup failed"
-        }
+        return {"domain": domain, "error": "WHOIS lookup failed"}
 
 # ---------------------------
-# RISK SCORING (EXPLAINABLE)
+# RISK SCORING
 # ---------------------------
 
 def compute_risk(ofac_hit, un_hit, country):
@@ -136,7 +122,7 @@ def compute_risk(ofac_hit, un_hit, country):
 
     if ofac_hit:
         score += 60
-        factors.append("OFAC sanctions exposure")
+        factors.append("OFAC SDN sanctions exposure")
 
     if un_hit:
         score += 50
@@ -205,10 +191,6 @@ if run and name:
         except Exception as e:
             st.warning(f"UN check failed: {e}")
 
-    # ---------------------------
-    # RESULTS
-    # ---------------------------
-
     st.subheader("📋 Screening Results")
 
     if results:
@@ -252,7 +234,6 @@ if run and name:
     else:
         st.write("No material public risk factors identified.")
 
-    # Audit footer
     st.caption(
         f"Screened on {datetime.utcnow().isoformat()} UTC | "
         "Sources: OFAC SDN, UN Consolidated List | "
