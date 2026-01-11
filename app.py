@@ -3,10 +3,11 @@
 import streamlit as st
 import pandas as pd
 import requests
-import difflib
 import whois
 from datetime import datetime
 import xml.etree.ElementTree as ET
+
+from rapidfuzz import fuzz
 
 # ---------------------------
 # CONFIG
@@ -17,33 +18,24 @@ OFAC_SDN_URL = "https://www.treasury.gov/ofac/downloads/sdn.csv"
 
 MATCH_THRESHOLD = 85
 
-# FATF-style country risk (public, simplified, transparent)
-FATF_HIGH_RISK = {
-    "iran", "north korea", "myanmar"
-}
-
-FATF_MONITORED = {
-    "panama", "haiti", "south sudan", "syria"
-}
+FATF_HIGH_RISK = {"iran", "north korea", "myanmar"}
+FATF_MONITORED = {"panama", "haiti", "south sudan", "syria"}
 
 # ---------------------------
-# TEXT NORMALISATION & MATCHING
+# NORMALISATION & MATCHING
 # ---------------------------
 
 def normalize(text: str) -> str:
-    return " ".join(sorted(text.lower().split()))
+    return " ".join(text.lower().split())
 
-def similarity(a: str, b: str) -> float:
-    return difflib.SequenceMatcher(None, a, b).ratio() * 100
-
-def fuzzy_match(name, candidates):
+def fuzzy_match(query, candidates):
     matches = []
-    name_n = normalize(name)
+    q = normalize(query)
 
     for c in candidates:
-        score = similarity(name_n, normalize(c))
+        score = fuzz.token_sort_ratio(q, normalize(c))
         if score >= MATCH_THRESHOLD:
-            matches.append((c, round(score, 1)))
+            matches.append((c, score))
 
     return sorted(matches, key=lambda x: x[1], reverse=True)
 
@@ -54,12 +46,13 @@ def fuzzy_match(name, candidates):
 @st.cache_data(ttl=86400)
 def load_ofac():
     df = pd.read_csv(OFAC_SDN_URL)
-    df.columns = [c.lower().strip() for c in df.columns]
 
-    if "name" not in df.columns:
-        raise ValueError("Unexpected OFAC SDN format")
+    # OFAC uses SDN_NAME in most versions
+    for col in df.columns:
+        if col.lower() in {"sdn_name", "name"}:
+            return df[col].dropna().unique().tolist()
 
-    return df["name"].dropna().unique().tolist()
+    raise ValueError(f"OFAC SDN name column not found: {df.columns}")
 
 @st.cache_data(ttl=86400)
 def load_un():
@@ -69,13 +62,20 @@ def load_un():
     names = []
 
     for individual in tree.findall(".//INDIVIDUAL"):
-        name = " ".join(filter(None, [
+        parts = [
             individual.findtext("FIRST_NAME"),
             individual.findtext("SECOND_NAME"),
-            individual.findtext("THIRD_NAME")
-        ]))
-        if name.strip():
-            names.append(name)
+            individual.findtext("THIRD_NAME"),
+            individual.findtext("FOURTH_NAME"),
+        ]
+        full_name = " ".join(p for p in parts if p)
+        if full_name:
+            names.append(full_name)
+
+        # aliases
+        for alias in individual.findall(".//ALIAS_NAME"):
+            if alias.text:
+                names.append(alias.text)
 
     for entity in tree.findall(".//ENTITY"):
         name = entity.findtext("NAME")
@@ -85,7 +85,7 @@ def load_un():
     return list(set(names))
 
 # ---------------------------
-# CYBER / DOMAIN SIGNALS
+# CYBER SIGNALS
 # ---------------------------
 
 def check_domain(domain):
@@ -98,13 +98,10 @@ def check_domain(domain):
             "country": w.country
         }
     except Exception:
-        return {
-            "domain": domain,
-            "error": "WHOIS lookup failed"
-        }
+        return {"domain": domain, "error": "WHOIS lookup failed"}
 
 # ---------------------------
-# RISK SCORING (EXPLAINABLE)
+# RISK SCORING
 # ---------------------------
 
 def compute_risk(ofac_hit, un_hit, country):
@@ -129,110 +126,3 @@ def compute_risk(ofac_hit, un_hit, country):
             factors.append("FATF monitored jurisdiction")
 
     return min(score, 100), factors
-
-# ---------------------------
-# STREAMLIT UI
-# ---------------------------
-
-st.set_page_config(
-    page_title="Integrity & Financial Crime Screening",
-    layout="wide"
-)
-
-st.title("🔍 Public Integrity & Financial Crime Screening Tool")
-
-st.caption(
-    "Uses UN Consolidated List and OFAC SDN List (public sources). "
-    "Country risk is contextual (FATF-inspired). Not legal advice."
-)
-
-name = st.text_input("Individual or Organisation Name")
-country = st.text_input("Country (optional)")
-domain = st.text_input("Website / Domain (optional)")
-run = st.button("Run Screening")
-
-# ---------------------------
-# SCREENING LOGIC
-# ---------------------------
-
-if run and name:
-
-    with st.spinner("Running integrity screening…"):
-        results = []
-        ofac_hit = False
-        un_hit = False
-
-        # OFAC
-        try:
-            ofac_names = load_ofac()
-            matches = fuzzy_match(name, ofac_names)
-            if matches:
-                ofac_hit = True
-                results.append(("OFAC SDN List", matches))
-        except Exception as e:
-            st.warning(f"OFAC check failed: {e}")
-
-        # UN
-        try:
-            un_names = load_un()
-            matches = fuzzy_match(name, un_names)
-            if matches:
-                un_hit = True
-                results.append(("UN Consolidated Sanctions List", matches))
-        except Exception as e:
-            st.warning(f"UN check failed: {e}")
-
-    st.subheader("📋 Screening Results")
-
-    if results:
-        for source, matches in results:
-            st.error(f"⚠️ Potential match on {source}")
-            st.dataframe(
-                pd.DataFrame(
-                    matches,
-                    columns=["Matched Name", "Similarity (%)"]
-                )
-            )
-    else:
-        st.success("✅ No matches found on UN or OFAC public lists")
-
-    # Country risk
-    if country:
-        st.subheader("🌍 Country Risk Context")
-        c = country.lower()
-        if c in FATF_HIGH_RISK:
-            st.warning("High-risk jurisdiction (FATF)")
-        elif c in FATF_MONITORED:
-            st.info("Monitored jurisdiction (FATF)")
-        else:
-            st.success("No elevated FATF country risk identified")
-
-    # Cyber signals
-    if domain:
-        st.subheader("🌐 Cyber / Domain Signals")
-        st.json(check_domain(domain))
-
-    # Risk score
-    risk_score, factors = compute_risk(ofac_hit, un_hit, country)
-
-    st.subheader("📊 Overall Risk Assessment")
-    st.metric("Indicative Risk Score", f"{risk_score} / 100")
-
-    if factors:
-        st.write("Risk drivers:")
-        for f in factors:
-            st.write(f"• {f}")
-    else:
-        st.write("No material public risk factors identified.")
-
-    # Audit footer
-    st.caption(
-        f"Screened on {datetime.utcnow().isoformat()} UTC | "
-        "Sources: OFAC SDN, UN Consolidated List | "
-        "Public data only | Not legal advice"
-    )
-
-    st.caption(
-        "Note: UN matching uses primary names only. "
-        "Aliases and adverse media are not yet included."
-    )
